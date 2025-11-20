@@ -1,85 +1,105 @@
 import time
-from Protocol.segment import Segment 
-import Transport.socket_wrapper as sw
+from typing import Dict, Optional
+from Protocol.segment import Segment
+from Transport.socket_wrapper import SocketWrapper
+
 
 class ReliabilityLayer:
-    def __init__(self, window_size, timeout_interval):
+    def __init__(self, window_size: int = 1, timeout_interval: float = 1.0):
         self.window_size = window_size
         self.timeout_interval = timeout_interval
         
         self.send_base = 0
         self.next_seq_num = 0
-        self.buffer = {}            # {seq_num: segment_object}
-        self.timer_start = None
-
+        self.buffer: Dict[int, Segment] = {}
+        self.timers: Dict[int, float] = {}
+        
     def can_send(self) -> bool:
-        """Checks if the window is full."""
+        """Check if window allows sending new segment"""
         return (self.next_seq_num - self.send_base) < self.window_size
-
-    def send_packet(self, segment, sock_wrapper: sw.SocketWrapper) -> bool:
-        """
-        Sends a packet using the socket wrapper and buffers it.
-        """
+        
+    def send_segment(self, segment: Segment, sock_wrapper: SocketWrapper) -> bool:
+        """Send segment and buffer for potential retransmission"""
         if not self.can_send():
-            return False 
-
-        segment.seq_num = self.next_seq_num
-
-        # Use the wrapper to send
-        sock_wrapper.send_segment(segment.encode())
-        
-        # Buffer it for potential retransmission
-        self.buffer[self.next_seq_num] = segment
-        
-        # Start timer if this is the oldest unacked packet
-        if self.send_base == self.next_seq_num:
-            self.timer_start = time.time()
+            return False
             
+        segment.seq_num = self.next_seq_num
+        sock_wrapper.send_segment(segment.serialize())
+        
+        self.buffer[self.next_seq_num] = segment
+        self.timers[self.next_seq_num] = time.time()
+        
         self.next_seq_num += 1
         return True
-
-    def receive_ack(self, ack_num) -> int:
-        """
-        Handles Cumulative ACKs. Returns number of new packets acked.
-        """
+        
+    def receive_ack(self, ack_num: int) -> int:
+        """Process cumulative ACK and update window"""
         packets_acked = 0
+        
         if ack_num > self.send_base:
             packets_acked = ack_num - self.send_base
             
-            # Remove acked packets from buffer
-            for offset in range(packets_acked):
-                self.buffer.pop(self.send_base + offset, None)
+            for seq in range(self.send_base, ack_num):
+                self.buffer.pop(seq, None)
+                self.timers.pop(seq, None)
                 
             self.send_base = ack_num
             
-            # Reset or stop timer
-            if self.send_base != self.next_seq_num:
-                self.timer_start = time.time()
-            else:
-                self.timer_start = None # Window empty
-                
         return packets_acked
-
-    def check_timeout(self, sock_wrapper: sw.SocketWrapper) -> bool:
-        """
-        Checks if timeout occurred. Resends.
-        Returns True if a timeout occurred (signal to Sender), False otherwise.
-        """
-        if self.timer_start is None:
-            return False
-
-        # if time since timer_start exceeds timeout_interval then timeout
-        if (time.time() - self.timer_start) > self.timeout_interval:
-            print(f"[Reliability] Timeout! Resending from {self.send_base}...")
-            
-            # Go-Back-N Retransmission
-            for seq in range(self.send_base, self.next_seq_num):
-                if seq in self.buffer:
-                    seg = self.buffer[seq]
-                    sock_wrapper.send_segment(seg.encode())
-            
-            # Restart timer
-            self.timer_start = time.time()
-            return True # Signal that timeout happened
-            
+        
+    def check_timeouts(self, sock_wrapper: SocketWrapper) -> bool:
+        """Check for timeouts and retransmit if necessary"""
+        current_time = time.time()
+        timeout_occurred = False
+        
+        for seq_num in list(self.timers.keys()):
+            if seq_num < self.send_base:
+                self.timers.pop(seq_num, None)
+                continue
+                
+            if current_time - self.timers[seq_num] > self.timeout_interval:
+                if seq_num in self.buffer:
+                    segment = self.buffer[seq_num]
+                    sock_wrapper.send_segment(segment.serialize())
+                    self.timers[seq_num] = current_time
+                    timeout_occurred = True
+                    
+        return timeout_occurred
+        
+    def get_oldest_unacked_seq(self) -> Optional[int]:
+        """Get sequence number of oldest unacknowledged segment"""
+        if self.send_base < self.next_seq_num:
+            return self.send_base
+        return None
+        
+    def is_segment_in_buffer(self, seq_num: int) -> bool:
+        """Check if segment is in retransmission buffer"""
+        return seq_num in self.buffer
+        
+    def retransmit_segment(self, seq_num: int, sock_wrapper: SocketWrapper) -> bool:
+        """Retransmit specific segment (for fast retransmit)"""
+        if seq_num in self.buffer:
+            segment = self.buffer[seq_num]
+            sock_wrapper.send_segment(segment.serialize())
+            self.timers[seq_num] = time.time()
+            return True
         return False
+        
+    def update_window_size(self, new_size: int):
+        """Update sliding window size"""
+        self.window_size = max(1, new_size)
+        
+    def get_window_usage(self) -> int:
+        """Get current window usage"""
+        return self.next_seq_num - self.send_base
+        
+    def is_window_full(self) -> bool:
+        """Check if sending window is full"""
+        return self.get_window_usage() >= self.window_size
+        
+    def reset(self):
+        """Reset reliability layer state"""
+        self.send_base = 0
+        self.next_seq_num = 0
+        self.buffer.clear()
+        self.timers.clear()
