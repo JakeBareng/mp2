@@ -1,5 +1,11 @@
 import time
+import sys
+import os
 from typing import Optional, Tuple
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from Transport.socket_wrapper import SocketWrapper
 from Protocol.segment import Segment, SegmentFlags
 from Protocol.reliability import ReliabilityLayer
@@ -32,6 +38,7 @@ class Receiver:
 
         self.seq_num = 0
         self.expected_seq = 0
+        self.expected_data_seq = 1  # Expected sequence number for data packets (starts after handshake)
         self.received_data = bytearray()
         self.connection_established = False
         
@@ -48,17 +55,21 @@ class Receiver:
         """Accept incoming connection using three-way handshake"""
         if self.state != ReceiverState.LISTEN:
             return False
-            
+
         try:
             # Wait for SYN
+            print(f"Waiting for SYN packet (timeout={timeout}s)...")
             data, addr = self.sock_wrapper.recv_segment(timeout=timeout)
+            print(f"Received packet from {addr}, size={len(data)} bytes")
             syn_segment = Segment.deserialize(data)
+            print(f"Deserialized segment: {syn_segment}")
             
             if syn_segment and syn_segment.is_syn():
+                print(f"Received valid SYN from {addr}")
                 self.remote_addr = addr
                 self.sock_wrapper.remote_addr = addr
                 self.expected_seq = syn_segment.seq_num + 1
-                
+
                 # Send SYN-ACK
                 syn_ack = Segment(
                     seq_num=self.seq_num,
@@ -66,25 +77,38 @@ class Receiver:
                     flags=SegmentFlags.SYN | SegmentFlags.ACK,
                     window_size=8192
                 )
-                
+
+                print(f"Sending SYN-ACK to {addr}")
                 self.sock_wrapper.send_segment(syn_ack.serialize())
                 self.state = ReceiverState.SYN_RCVD
-                
+
                 # Wait for ACK
+                print("Waiting for final ACK...")
                 data, _ = self.sock_wrapper.recv_segment(timeout=5.0)
                 ack_segment = Segment.deserialize(data)
-                
+
                 if (ack_segment and ack_segment.is_ack() and
                     ack_segment.ack_num == self.seq_num + 1):
-                    
+
+                    print("Three-way handshake completed!")
                     self.seq_num += 1
                     self.state = ReceiverState.ESTABLISHED
                     self.connection_established = True
+
+                    # Enable packet loss simulation after handshake
+                    self.sock_wrapper.enable_loss_simulation()
+                    print("Packet loss simulation now enabled")
                     return True
+                else:
+                    print(f"Invalid ACK received: {ack_segment}")
+            else:
+                print(f"Invalid SYN packet: syn_segment={syn_segment}")
                     
         except Exception as e:
             print(f"Connection accept failed: {e}")
-            
+            import traceback
+            traceback.print_exc()
+
         self.state = ReceiverState.CLOSED
         return False
         
@@ -107,19 +131,44 @@ class Receiver:
                 
             # Handle data segment
             if segment.payload and len(segment.payload) > 0:
-                # Send ACK
-                ack_segment = Segment(
-                    seq_num=self.seq_num,
-                    ack_num=segment.seq_num + len(segment.payload),
-                    flags=SegmentFlags.ACK,
-                    window_size=8192
-                )
-                
-                self.sock_wrapper.send_segment(ack_segment.serialize())
-                
-                # Add to received data
-                self.received_data.extend(segment.payload)
-                return segment.payload
+                # Check if this is the expected packet (in-order delivery)
+                if segment.seq_num == self.expected_data_seq:
+                    # In-order packet: accept it
+                    self.received_data.extend(segment.payload)
+                    self.expected_data_seq += 1
+
+                    # Send ACK for the next expected packet
+                    ack_segment = Segment(
+                        seq_num=self.seq_num,
+                        ack_num=self.expected_data_seq,  # Cumulative ACK
+                        flags=SegmentFlags.ACK,
+                        window_size=8192
+                    )
+                    self.sock_wrapper.send_segment(ack_segment.serialize())
+                    return segment.payload
+
+                elif segment.seq_num < self.expected_data_seq:
+                    # Duplicate packet: ACK it again but don't add to data
+                    ack_segment = Segment(
+                        seq_num=self.seq_num,
+                        ack_num=self.expected_data_seq,  # ACK what we're still expecting
+                        flags=SegmentFlags.ACK,
+                        window_size=8192
+                    )
+                    self.sock_wrapper.send_segment(ack_segment.serialize())
+                    return None
+
+                else:
+                    # Out-of-order packet: discard and ACK what we're expecting
+                    # (Go-Back-N style: sender will retransmit from expected_data_seq)
+                    ack_segment = Segment(
+                        seq_num=self.seq_num,
+                        ack_num=self.expected_data_seq,  # ACK what we're still expecting
+                        flags=SegmentFlags.ACK,
+                        window_size=8192
+                    )
+                    self.sock_wrapper.send_segment(ack_segment.serialize())
+                    return None
                 
         except Exception:
             return None
@@ -128,6 +177,9 @@ class Receiver:
         
     def _handle_fin(self, fin_segment: Segment):
         """Handle FIN segment for connection termination"""
+        # Disable packet loss for clean disconnect
+        self.sock_wrapper.handshake_mode = True
+
         # Send ACK for FIN
         ack_segment = Segment(
             seq_num=self.seq_num,
@@ -135,25 +187,25 @@ class Receiver:
             flags=SegmentFlags.ACK,
             window_size=0
         )
-        
+
         self.sock_wrapper.send_segment(ack_segment.serialize())
         self.state = ReceiverState.CLOSE_WAIT
-        
+
         # Send FIN
         fin_response = Segment(
             seq_num=self.seq_num + 1,
             flags=SegmentFlags.FIN,
             window_size=0
         )
-        
+
         self.sock_wrapper.send_segment(fin_response.serialize())
         self.state = ReceiverState.LAST_ACK
-        
+
         # Wait for final ACK
         try:
             data, _ = self.sock_wrapper.recv_segment(timeout=5.0)
             final_ack = Segment.deserialize(data)
-            
+
             if final_ack and final_ack.is_ack():
                 self.state = ReceiverState.CLOSED
                 self.connection_established = False
@@ -213,10 +265,23 @@ if __name__ == '__main__':
 
         print("Connection established, receiving data...")
 
+        # Keep receiving until connection is closed (FIN received)
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 3
+
         while receiver.connection_established:
             data = receiver.receive_data(timeout=10.0)
             if data is None:
-                break
+                # Check if connection was closed (FIN received)
+                if not receiver.connection_established:
+                    break
+                # Otherwise, it's just a timeout - keep waiting
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= max_consecutive_timeouts:
+                    print(f"Warning: {consecutive_timeouts} consecutive timeouts, but continuing...")
+                    consecutive_timeouts = 0
+            else:
+                consecutive_timeouts = 0
 
         received_data = receiver.get_received_data()
 

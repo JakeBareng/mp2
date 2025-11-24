@@ -14,7 +14,7 @@ class SegmentFlags:
 
 class Segment:
     MAX_PAYLOAD_SIZE = 1024
-    HEADER_SIZE = 20
+    HEADER_SIZE = 18
     
     def __init__(self, seq_num: int = 0, ack_num: int = 0, flags: int = 0, 
                  window_size: int = 8192, payload: bytes = b''):
@@ -41,7 +41,7 @@ class Segment:
         """Serialize segment to bytes"""
         self.checksum = self.calculate_checksum()
 
-        header = struct.pack('!IIHHHH',
+        header = struct.pack('!IIHHIH',
                            self.seq_num,
                            self.ack_num,
                            self.flags,
@@ -57,7 +57,7 @@ class Segment:
             return None
 
         try:
-            header = struct.unpack('!IIHHHH', data[:cls.HEADER_SIZE])
+            header = struct.unpack('!IIHHIH', data[:cls.HEADER_SIZE])
             seq_num, ack_num, flags, window_size, received_checksum, payload_len = header
 
             payload = data[cls.HEADER_SIZE:cls.HEADER_SIZE + payload_len]

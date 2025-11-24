@@ -1,5 +1,5 @@
 /docs/
-**/__init__.py
+__pycache__/
 *.pyc
 *.pyo
 *.egg-info/
@@ -12,7 +12,6 @@ build/
 dist/
 *.log
 *.csv
-*.txt
 *.png
 *.jpg
 *.jpeg

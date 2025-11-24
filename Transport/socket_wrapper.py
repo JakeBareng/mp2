@@ -27,6 +27,7 @@ class SocketWrapper:
         self.loss_rate = loss_rate
         self.corruption_rate = corruption_rate
         self.delay_range = delay_range
+        self.handshake_mode = True  # Don't drop packets during handshake
 
         if local_addr is not None:
             self.sock.bind(local_addr)
@@ -54,7 +55,8 @@ class SocketWrapper:
 
     def send_segment(self, segment: bytes):
         """Send segment with simulated network conditions"""
-        if random.random() < self.loss_rate:
+        # Don't drop packets during handshake
+        if not self.handshake_mode and random.random() < self.loss_rate:
             return
 
         self._simulate_delay()
@@ -62,6 +64,10 @@ class SocketWrapper:
         segment = self._simulate_corruption(segment)
 
         self.sock.sendto(segment, self.remote_addr)
+
+    def enable_loss_simulation(self):
+        """Enable packet loss simulation (after handshake)"""
+        self.handshake_mode = False
 
     def recv_segment(self, timeout: Optional[float] = None):
         if timeout is not None:

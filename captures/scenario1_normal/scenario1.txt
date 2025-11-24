@@ -1,0 +1,33 @@
+python sender_main.py --remote-ip 127.0.0.1 --remote-port 9000 --file test_files/small.txt
+Starting file transfer...
+Network simulation: loss=0.0, corruption=0.0
+Connecting to ('127.0.0.1', 9000)...
+Sending SYN to ('127.0.0.1', 9000)...
+SYN sent, waiting for SYN-ACK...
+Received response, size=18 bytes
+Deserialized: Segment(seq=0, ack=1, flags=SYN,ACK, window=8192, payload_len=0)  
+Received valid SYN-ACK, sending final ACK...
+Connection established
+Sending file: test_files/small.txt (1038 bytes)
+File transfer completed
+Transfer completed successfully!
+File size: 1038 bytes
+Duration: 0.00 seconds
+Throughput: 380.97 KB/s
+Closing connection...
+Connection closed
+
+python Protocol/receiver.py --local-port 9000 --output received_wireshark1.txt
+Receiver listening on 127.0.0.1:9000
+Waiting for connection...
+Waiting for SYN packet (timeout=30.0s)...
+Received packet from ('127.0.0.1', 8080), size=18 bytes
+Deserialized segment: Segment(seq=0, ack=0, flags=SYN, window=8192, payload_len=0)
+Received valid SYN from ('127.0.0.1', 8080)
+Sending SYN-ACK to ('127.0.0.1', 8080)
+Waiting for final ACK...
+Three-way handshake completed!
+Connection established, receiving data...
+File received successfully!
+Saved to: received_wireshark1.txt
+Total bytes: 1038

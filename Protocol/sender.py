@@ -1,6 +1,11 @@
 import os
+import sys
 import time
 from typing import Optional
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from Transport.socket_wrapper import SocketWrapper
 from Protocol.segment import Segment, SegmentFlags
 from Protocol.reliability import ReliabilityLayer
@@ -34,7 +39,7 @@ class Sender:
         )
 
         self.state = SenderState.CLOSED
-        self.reliability = ReliabilityLayer(window_size=1, timeout_interval=1.0)
+        self.reliability = ReliabilityLayer(window_size=5, timeout_interval=1.0)
         self.congestion_control = CongestionControl()
 
         self.seq_num = 0
@@ -46,26 +51,31 @@ class Sender:
         if not os.path.exists(self.file_path):
             print(f"File not found: {self.file_path}")
             return False
-            
+
         self.file_size = os.path.getsize(self.file_path)
         print(f"Connecting to {self.remote_addr}...")
-        
+
         syn_segment = Segment(
             seq_num=self.seq_num,
             flags=SegmentFlags.SYN,
             window_size=8192
         )
-        
+
+        print(f"Sending SYN to {self.remote_addr}...")
         self.sock_wrapper.send_segment(syn_segment.serialize())
         self.state = SenderState.SYN_SENT
+        print("SYN sent, waiting for SYN-ACK...")
         
         try:
             data, _ = self.sock_wrapper.recv_segment(timeout=5.0)
+            print(f"Received response, size={len(data)} bytes")
             syn_ack = Segment.deserialize(data)
-            
+            print(f"Deserialized: {syn_ack}")
+
             if (syn_ack and syn_ack.is_syn() and syn_ack.is_ack() and
                 syn_ack.ack_num == self.seq_num + 1):
-                
+
+                print("Received valid SYN-ACK, sending final ACK...")
                 self.seq_num += 1
                 ack_segment = Segment(
                     seq_num=self.seq_num,
@@ -73,16 +83,23 @@ class Sender:
                     flags=SegmentFlags.ACK,
                     window_size=8192
                 )
-                
+
                 self.sock_wrapper.send_segment(ack_segment.serialize())
                 self.state = SenderState.ESTABLISHED
                 self.reliability.send_base = self.seq_num
                 self.reliability.next_seq_num = self.seq_num
-                print("Connection established")
+
+                # Enable packet loss simulation after handshake
+                self.sock_wrapper.enable_loss_simulation()
+                print("Connection established (packet loss simulation now enabled)")
                 return True
-                
+            else:
+                print(f"Invalid SYN-ACK: syn_ack={syn_ack}")
+
         except Exception as e:
             print(f"Connection failed: {e}")
+            import traceback
+            traceback.print_exc()
             
         self.state = SenderState.CLOSED
         return False
@@ -91,33 +108,46 @@ class Sender:
         """Send file using reliable transport with flow and congestion control"""
         if self.state != SenderState.ESTABLISHED:
             return False
-            
+
         print(f"Sending file: {self.file_path} ({self.file_size} bytes)")
-        
+
+        # Read all file data first
         with open(self.file_path, 'rb') as file:
-            while self.bytes_sent < self.file_size:
-                self._update_window_size()
-                
-                while (self.bytes_sent < self.file_size and 
-                       self.reliability.can_send()):
-                    
-                    chunk = file.read(Segment.MAX_PAYLOAD_SIZE)
-                    if not chunk:
-                        break
-                        
-                    data_segment = Segment(
-                        seq_num=0,  # Will be set by reliability layer
-                        flags=SegmentFlags.ACK,
-                        window_size=8192,
-                        payload=chunk
-                    )
-                    
-                    if self.reliability.send_segment(data_segment, self.sock_wrapper):
-                        self.bytes_sent += len(chunk)
-                        
-                self._process_acks()
-                self._handle_timeouts()
-                
+            file_data = file.read()
+
+        bytes_read = 0
+        last_progress = 0
+
+        # Send all data with reliability
+        while bytes_read < len(file_data) or self.reliability.send_base < self.reliability.next_seq_num:
+            self._update_window_size()
+
+            # Send new packets if we have data and window space
+            while bytes_read < len(file_data) and self.reliability.can_send():
+                chunk = file_data[bytes_read:bytes_read + Segment.MAX_PAYLOAD_SIZE]
+                if not chunk:
+                    break
+
+                data_segment = Segment(
+                    seq_num=0,  # Will be set by reliability layer
+                    flags=SegmentFlags.ACK,
+                    window_size=8192,
+                    payload=chunk
+                )
+
+                if self.reliability.send_segment(data_segment, self.sock_wrapper):
+                    bytes_read += len(chunk)
+                    self.bytes_sent = bytes_read
+
+            # Show progress every 10%
+            progress = int(bytes_read * 100 / len(file_data))
+            if progress >= last_progress + 10:
+                print(f"Progress: {progress}% ({bytes_read}/{len(file_data)} bytes), send_base={self.reliability.send_base}, next_seq={self.reliability.next_seq_num}, window={self.reliability.window_size}")
+                last_progress = progress
+
+            self._process_acks()
+            self._handle_timeouts()
+
         self._wait_for_all_acks()
         print("File transfer completed")
         return True
@@ -161,26 +191,35 @@ class Sender:
     def _wait_for_all_acks(self):
         """Wait for all segments to be acknowledged"""
         timeout_start = time.time()
-        
+
+        print(f"Waiting for all ACKs... send_base={self.reliability.send_base}, next_seq={self.reliability.next_seq_num}")
+
         while (self.reliability.send_base < self.reliability.next_seq_num and
-               time.time() - timeout_start < 10.0):
+               time.time() - timeout_start < 30.0):  # Increased to 30 seconds
             self._process_acks()
             self._handle_timeouts()
             time.sleep(0.01)
+
+        elapsed = time.time() - timeout_start
+        unacked = self.reliability.next_seq_num - self.reliability.send_base
+        print(f"Wait completed: elapsed={elapsed:.2f}s, unacked_packets={unacked}")
             
     def disconnect(self) -> bool:
         """Close connection using four-way handshake"""
         if self.state != SenderState.ESTABLISHED:
             return False
-            
+
         print("Closing connection...")
-        
+
+        # Disable packet loss for clean disconnect
+        self.sock_wrapper.handshake_mode = True
+
         fin_segment = Segment(
             seq_num=self.reliability.next_seq_num,
             flags=SegmentFlags.FIN,
             window_size=0
         )
-        
+
         self.sock_wrapper.send_segment(fin_segment.serialize())
         self.state = SenderState.FIN_WAIT_1
         
