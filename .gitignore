@@ -1,5 +1,6 @@
 /docs/
 __pycache__/
+captures/**/*.txt
 *.pyc
 *.pyo
 *.egg-info/
@@ -12,7 +13,6 @@ build/
 dist/
 *.log
 *.csv
-*.png
 *.jpg
 *.jpeg
 *.gif
